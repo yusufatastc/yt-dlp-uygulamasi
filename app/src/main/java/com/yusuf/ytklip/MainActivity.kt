@@ -2,9 +2,9 @@ package com.yusuf.ytklip
 
 import android.app.Activity
 import android.content.ClipboardManager
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
@@ -14,11 +14,8 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
 import android.graphics.drawable.StateListDrawable
+import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.os.Handler
-import android.os.Looper
-import android.provider.MediaStore
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.method.DigitsKeyListener
@@ -26,30 +23,24 @@ import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
-import android.webkit.MimeTypeMap
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
-import com.yausername.youtubedl_android.YoutubeDLRequest
-import java.io.File
-import java.util.Locale
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
 
     private val io = Executors.newSingleThreadExecutor()
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var ready = false
-    @Volatile private var busy = false
-    @Volatile private var cancelled = false
+    @Volatile private var updating = false   // yt-dlp güncellenirken true
 
     // ---- renkler (siyah + mavi)
     private val cBg1 = Color.parseColor("#05080F")
@@ -74,7 +65,6 @@ class MainActivity : Activity() {
     private lateinit var urlInput: EditText
     private lateinit var startInput: EditText
     private lateinit var endInput: EditText
-    private lateinit var exactCut: CheckBox
     private lateinit var nightly: CheckBox
     private lateinit var downloadBtn: Button
     private lateinit var cancelBtn: Button
@@ -88,27 +78,6 @@ class MainActivity : Activity() {
     private val chips = mutableListOf<TextView>()
     private var qualityIndex = 2
 
-    // ---- ilerleme durumu
-    private var dlPasses = 1
-    private var dlDestCount = 0
-    private var dlClipSec = 0.0
-    private var dlOverall = 0.0
-    private var dlBytes = 0L
-    private var dlSpeed: String? = null
-    private var dlEta: String? = null
-    private var pollDir: File? = null
-
-    // inen dosyanın boyutunu düzenli ölçer (yüzde gelmese bile bir şeyler aktığını gösterir)
-    private val poller = object : Runnable {
-        override fun run() {
-            val dir = pollDir
-            if (dir == null || !busy) return
-            dlBytes = dir.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
-            renderStats()
-            mainHandler.postDelayed(this, 700)
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
@@ -119,6 +88,19 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleIntent(intent)
+    }
+
+    // Uygulamaya dönünce servisin son durumunu göster, ayrılırken dinlemeyi bırak.
+    // (İndirme servis üzerinde devam ettiği için ekran kapansa da durmaz.)
+    override fun onStart() {
+        super.onStart()
+        DownloadState.listener = { s -> runOnUiThread { applySnapshot(s) } }
+        DownloadState.snapshot?.let { applySnapshot(it) }
+    }
+
+    override fun onStop() {
+        DownloadState.listener = null
+        super.onStop()
     }
 
     // ============================================================ UI
@@ -272,8 +254,25 @@ class MainActivity : Activity() {
         }
         setContentView(scroll)
 
-        // Başlık
-        root.addView(TextView(this).apply {
+        // Başlık (logo + isim)
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val logoId = resources.getIdentifier("logo_mark", "drawable", packageName)
+        if (logoId != 0) {
+            titleRow.addView(
+                ImageView(this).apply {
+                    setImageResource(logoId)
+                    adjustViewBounds = true
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)
+                ).apply { marginEnd = dp(10) }
+            )
+        }
+        titleRow.addView(TextView(this).apply {
             text = SpannableString("YtKlip").apply {
                 setSpan(ForegroundColorSpan(cAccent2), 2, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
@@ -282,6 +281,7 @@ class MainActivity : Activity() {
             typeface = fBlack
             letterSpacing = -0.02f
         })
+        root.addView(titleRow)
         root.addView(TextView(this).apply {
             text = "Videodan sadece istediğin kısmı indir"
             setTextColor(cMuted)
@@ -319,8 +319,6 @@ class MainActivity : Activity() {
         timeRow.addView(startInput, rowParams(1f, 8))
         timeRow.addView(endInput, rowParams(1f))
         cutCard.addView(timeRow)
-        exactCut = makeCheck("Tam kare kesim (daha yavaş, başlangıç daha doğru)")
-        cutCard.addView(exactCut)
         root.addView(cutCard)
 
         // Kalite
@@ -416,22 +414,18 @@ class MainActivity : Activity() {
         ).apply { topMargin = dp(6) })
         root.addView(updateCard)
 
-        setBusy(false)
+        refreshButtons()
     }
 
     // ------------------------------------------------ ekran güncelleme
 
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
 
-    private fun setBusy(b: Boolean) {
-        enable(downloadBtn, !b && ready)
-        enable(updateBtn, !b && ready)
-        enable(cancelBtn, b)
-        if (b) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
+    private fun refreshButtons() {
+        val downloading = DownloadState.busy
+        enable(downloadBtn, ready && !downloading && !updating)
+        enable(updateBtn, ready && !downloading && !updating)
+        enable(cancelBtn, downloading)
     }
 
     private fun setStage(s: String, color: Int = cMuted) {
@@ -457,19 +451,32 @@ class MainActivity : Activity() {
         messageView.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
     }
 
-    private fun renderStats() {
-        val parts = mutableListOf<String>()
-        if (dlBytes > 0) parts.add(formatBytes(dlBytes))
-        dlSpeed?.let { parts.add(it) }
-        dlEta?.let { if (it != "Unknown") parts.add("kalan $it") }
-        statsView.text = parts.joinToString("   ·   ")
+    private fun toneColor(t: Tone): Int = when (t) {
+        Tone.OK -> cOk
+        Tone.ERROR -> cDanger
+        else -> cMuted
     }
 
-    private fun formatBytes(b: Long): String = when {
-        b >= (1L shl 30) -> String.format(Locale.US, "%.2f GB", b / 1073741824.0)
-        b >= (1L shl 20) -> String.format(Locale.US, "%.1f MB", b / 1048576.0)
-        b >= (1L shl 10) -> String.format(Locale.US, "%.0f KB", b / 1024.0)
-        else -> "$b B"
+    // Servisten gelen durumu ekrana yansıtır
+    private fun applySnapshot(s: DlSnapshot) {
+        setStage(s.stage, toneColor(s.stageTone))
+        if (s.indeterminate) setIndeterminate() else setPercent(s.percent)
+        statsView.text = s.stats
+        showMessage(s.message, toneColor(s.messageTone))
+        refreshButtons()
+    }
+
+    private fun showIdleOrSnapshot() {
+        val s = DownloadState.snapshot
+        if (s != null) {
+            applySnapshot(s)
+        } else {
+            setStage("Hazır")
+            setPercent(0.0)
+            statsView.text = ""
+            showMessage("")
+            refreshButtons()
+        }
     }
 
     // ============================================================ girdiler
@@ -479,12 +486,6 @@ class MainActivity : Activity() {
     // 2.38.20 / 2,38,20 / 2 38 20 -> 2:38:20
     private fun normalizeTime(s: String): String =
         s.trim().replace('.', ':').replace(',', ':').replace(' ', ':')
-
-    private fun toSeconds(t: String): Double {
-        var total = 0.0
-        for (part in t.split(":")) total = total * 60 + (part.toDoubleOrNull() ?: 0.0)
-        return total
-    }
 
     private fun handleIntent(i: Intent?) {
         if (i == null || i.action != Intent.ACTION_SEND) return
@@ -505,6 +506,12 @@ class MainActivity : Activity() {
     // ============================================================ motor
 
     private fun initEngine() {
+        // Ekran yeniden oluşturulduysa (döndürme vb.) motor zaten hazırdır
+        if (engineReady) {
+            ready = true
+            showIdleOrSnapshot()
+            return
+        }
         setStage("Motor hazırlanıyor…")
         setIndeterminate()
         showMessage("İlk açılışta biraz sürebilir.")
@@ -512,13 +519,9 @@ class MainActivity : Activity() {
             try {
                 YoutubeDL.getInstance().init(applicationContext)
                 FFmpeg.getInstance().init(applicationContext)
+                engineReady = true
                 ready = true
-                ui {
-                    setBusy(false)
-                    setStage("Hazır")
-                    setPercent(0.0)
-                    showMessage("")
-                }
+                ui { showIdleOrSnapshot() }
             } catch (e: Throwable) {
                 ui {
                     setStage("Başlatma hatası", cDanger)
@@ -530,9 +533,9 @@ class MainActivity : Activity() {
     }
 
     private fun updateEngine() {
-        if (!ready || busy) return
-        busy = true
-        setBusy(true)
+        if (!ready || updating || DownloadState.busy) return
+        updating = true
+        refreshButtons()
         setStage("yt-dlp güncelleniyor…")
         setIndeterminate()
         statsView.text = ""
@@ -546,68 +549,28 @@ class MainActivity : Activity() {
             } catch (e: Throwable) {
                 ui { showMessage("Güncelleme hatası: ${e.message}", cDanger) }
             } finally {
-                busy = false
+                updating = false
                 ui {
                     setPercent(0.0)
                     setStage("Hazır")
-                    setBusy(false)
+                    refreshButtons()
                 }
             }
         }
     }
 
-    private fun cancelDownload() {
-        cancelled = true
-        Thread {
-            try {
-                YoutubeDL.getInstance().destroyProcessById(PROCESS_ID)
-            } catch (e: Exception) {
-                // yok say
-            }
-        }.start()
-        setStage("İptal ediliyor…")
-    }
+    // ============================================================ indirme (servis üzerinden)
 
-    // yt-dlp / ffmpeg çıktısındaki her satırı yorumlar
-    private fun handleLine(raw: String) {
-        val line = raw.trim()
-        if (line.isEmpty() || !busy) return
-
-        FORMATS_RE.find(line)?.let {
-            dlPasses = it.groupValues[1].split("+").size.coerceAtLeast(1)
+    private fun askNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
         }
-        if (line.contains("Destination:")) dlDestCount++
-
-        if (MERGE_MARKERS.any { line.contains(it) }) {
-            setStage("Birleştiriliyor…")
-            if (dlOverall < 99.0) dlOverall = 99.0
-            setPercent(dlOverall)
-            return
-        }
-
-        var frac = -1.0
-        if (line.startsWith("[download]")) {
-            DL_PERCENT.find(line)?.let { frac = it.groupValues[1].toDouble() / 100.0 }
-            DL_SPEED.find(line)?.let { dlSpeed = it.groupValues[1] }
-            DL_ETA.find(line)?.let { dlEta = it.groupValues[1] }
-        } else if (dlClipSec > 0) {
-            OUT_TIME.find(line)?.let {
-                frac = (toSeconds(it.groupValues[1]) / dlClipSec).coerceIn(0.0, 1.0)
-            }
-        }
-
-        if (frac >= 0) {
-            val idx = (dlDestCount - 1).coerceIn(0, dlPasses - 1)
-            val overall = (idx + frac) / dlPasses * 100.0
-            if (overall > dlOverall) dlOverall = overall
-            setStage("İndiriliyor")
-            setPercent(dlOverall)
-        }
-        renderStats()
     }
 
     private fun startDownload() {
-        if (!ready || busy) return
+        if (!ready || updating || DownloadState.busy) return
 
         val url = extractUrl(urlInput.text.toString().trim())
         if (url == null) {
@@ -633,163 +596,56 @@ class MainActivity : Activity() {
 
         var clipSec = 0.0
         if (useSection && end != "inf") {
-            clipSec = toSeconds(end) - toSeconds(start)
+            clipSec = timeToSeconds(end) - timeToSeconds(start)
             if (clipSec <= 0) {
                 showMessage("Bitiş zamanı başlangıçtan sonra olmalı.", cDanger)
                 return
             }
         }
 
-        val height = HEIGHTS[qualityIndex]
-        val audioOnly = height == 0
-        val exact = exactCut.isChecked
-        val sStart = start
-        val sEnd = end
+        // Bildirim izni (Android 13+). Verilmese de indirme çalışır, sadece bildirim görünmez.
+        askNotificationPermission()
 
-        val workDir = File(cacheDir, "dl/${System.currentTimeMillis()}").also { it.mkdirs() }
+        // Ekran hemen tepki versin, çift dokunuş da engellensin
+        DownloadState.update(DlSnapshot(busy = true, stage = "Başlıyor…", indeterminate = true))
 
-        dlPasses = 1
-        dlDestCount = 0
-        dlClipSec = clipSec
-        dlOverall = 0.0
-        dlBytes = 0L
-        dlSpeed = null
-        dlEta = null
-        cancelled = false
-
-        busy = true
-        setBusy(true)
-        setStage("Başlıyor…")
-        setIndeterminate()
-        statsView.text = ""
-        showMessage("")
-        pollDir = workDir
-        mainHandler.removeCallbacks(poller)
-        mainHandler.post(poller)
-
-        io.execute {
-            try {
-                val request = YoutubeDLRequest(url)
-                request.addOption("--no-playlist")
-                request.addOption("--no-mtime")
-                request.addOption("-o", workDir.absolutePath + "/%(title).60s [%(id)s].%(ext)s")
-                if (audioOnly) {
-                    request.addOption("-f", "ba[ext=m4a]/ba")
-                } else {
-                    request.addOption("-f", videoFormat(height))
-                    request.addOption("--merge-output-format", "mp4/mkv")
-                }
-                if (useSection) {
-                    request.addOption("--download-sections", "*$sStart-$sEnd")
-                    // ffmpeg'in ilerleme bilgisini yt-dlp çıktısına geçirir
-                    request.addOption("--downloader-args", "ffmpeg:-progress pipe:1")
-                    if (exact) request.addOption("--force-keyframes-at-cuts")
-                }
-
-                val callback: (Float, Long, String) -> Unit = { _, _, line ->
-                    ui { handleLine(line) }
-                }
-                YoutubeDL.getInstance().execute(request, PROCESS_ID, callback)
-
-                val files = workDir.listFiles()
-                    ?.filter { it.isFile && it.extension.lowercase() in OUT_EXT }
-                    ?.sortedBy { it.name }
-                    ?: emptyList()
-                if (files.isEmpty()) {
-                    throw IllegalStateException("Çıktı dosyası oluşmadı.")
-                }
-                ui { setStage("Kaydediliyor…") }
-                val folders = files.map { saveToMedia(it) }.distinct()
-
-                ui {
-                    dlOverall = 100.0
-                    setPercent(100.0)
-                    setStage("Tamamlandı", cOk)
-                    statsView.text = ""
-                    showMessage(
-                        "Kaydedildi: " + folders.joinToString(", ") + "\n" +
-                            files.joinToString("\n") { it.name },
-                        cOk
-                    )
-                }
-            } catch (e: Throwable) {
-                if (cancelled) {
-                    ui {
-                        progressBar.isIndeterminate = false
-                        setStage("İptal edildi")
-                        showMessage("İndirme iptal edildi.")
-                    }
-                } else {
-                    val msg = e.message ?: e.toString()
-                    val hint = if (msg.contains("403")) {
-                        "\n\nİpucu: aşağıdan yt-dlp'yi güncelle, olmazsa Nightly'yi dene."
-                    } else ""
-                    ui {
-                        progressBar.isIndeterminate = false
-                        setStage("Hata", cDanger)
-                        showMessage(msg.takeLast(500) + hint, cDanger)
-                    }
-                }
-            } finally {
-                workDir.deleteRecursively()
-                busy = false
-                ui {
-                    pollDir = null
-                    mainHandler.removeCallbacks(poller)
-                    setBusy(false)
-                }
-            }
+        val i = Intent(this, DownloadService::class.java).apply {
+            action = DownloadService.ACTION_START
+            putExtra(DownloadService.EXTRA_URL, url)
+            putExtra(DownloadService.EXTRA_USE_SECTION, useSection)
+            putExtra(DownloadService.EXTRA_START, start)
+            putExtra(DownloadService.EXTRA_END, end)
+            putExtra(DownloadService.EXTRA_CLIP_SEC, clipSec)
+            putExtra(DownloadService.EXTRA_HEIGHT, HEIGHTS[qualityIndex])
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        } catch (e: Exception) {
+            DownloadState.update(
+                DlSnapshot(
+                    busy = false,
+                    stage = "Hata",
+                    stageTone = Tone.ERROR,
+                    message = e.message ?: e.toString(),
+                    messageTone = Tone.ERROR
+                )
+            )
         }
     }
 
-    private fun videoFormat(h: Int): String =
-        "bv*[height<=$h][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=$h]+ba/b[height<=$h]/b"
-
-    // Videoyu Galeri'ye (Movies/YtKlip), sesi Müzik'e (Music/YtKlip) kaydeder. İzin gerekmez (Android 10+).
-    private fun saveToMedia(file: File): String {
-        val mime = MimeTypeMap.getSingleton()
-            .getMimeTypeFromExtension(file.extension.lowercase()) ?: "application/octet-stream"
-        val (dir, collection) = when {
-            mime.startsWith("video") ->
-                Pair(Environment.DIRECTORY_MOVIES, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            mime.startsWith("audio") ->
-                Pair(Environment.DIRECTORY_MUSIC, MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-            else ->
-                Pair(Environment.DIRECTORY_DOWNLOADS, MediaStore.Downloads.EXTERNAL_CONTENT_URI)
-        }
-        val relative = "$dir/YtKlip"
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
-            put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, relative)
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }
-        val resolver = contentResolver
-        val uri = resolver.insert(collection, values)
-            ?: throw IllegalStateException("Dosya oluşturulamadı.")
-        val out = resolver.openOutputStream(uri)
-            ?: throw IllegalStateException("Dosya yazılamadı.")
-        out.use { o -> file.inputStream().use { it.copyTo(o) } }
-        values.clear()
-        values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-        return relative
+    private fun cancelDownload() {
+        startService(Intent(this, DownloadService::class.java).setAction(DownloadService.ACTION_CANCEL))
     }
 
     companion object {
-        private const val PROCESS_ID = "ytklip-download"
+        // Ekran yeniden oluşturulsa bile motoru tekrar başlatmamak için
+        @Volatile private var engineReady = false
+
         private const val BTN_PRIMARY = 0
         private const val BTN_NEUTRAL = 1
         private const val BTN_DANGER = 2
         private val QUALITIES = listOf("360p", "480p", "720p", "1080p", "Ses")
         private val HEIGHTS = listOf(360, 480, 720, 1080, 0)
-        private val OUT_EXT = setOf("mp4", "mkv", "webm", "m4a", "mp3", "opus", "mov", "aac", "ogg")
         private val TIME_REGEX = Regex("^\\d+(:\\d{1,2}){0,2}(\\.\\d+)?\$")
-        private val MERGE_MARKERS = listOf("[Merger]", "[VideoRemuxer]", "[ExtractAudio]", "[Fixup")
-        private val DL_PERCENT = Regex("""\[download\]\s+(\d+(?:\.\d+)?)%""")
-        private val DL_SPEED = Regex("""\bat\s+(\S+/s)""")
-        private val DL_ETA = Regex("""ETA\s+(\S+)""")
-        private val OUT_TIME = Regex("""^out_time=(\d+:\d+:\d+(?:\.\d+)?)""")
-        private val FORMATS_RE = Regex("""Downloading \d+ format\(s\):\s*(\S+)""")
     }
 }
