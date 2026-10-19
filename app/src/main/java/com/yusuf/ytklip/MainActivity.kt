@@ -400,12 +400,12 @@ var end = endInput.text.toString().trim().replace('.', ':')
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/YtKlip")
+put(MediaStore.MediaColumns.RELATIVE_PATH, (if (mime.startsWith("video")) Environment.DIRECTORY_MOVIES else if (mime.startsWith("audio")) Environment.DIRECTORY_MUSIC else Environment.DIRECTORY_DOWNLOADS) + "/YtKlip")            
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val resolver = contentResolver
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw IllegalStateException("İndirilenler'de dosya oluşturulamadı.")
+val uri = resolver.insert(if (mime.startsWith("video")) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else if (mime.startsWith("audio")) MediaStore.Audio.Media.EXTERNAL_CONTENT_URI else MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)            
+        ?: throw IllegalStateException("İndirilenler'de dosya oluşturulamadı.")
         val out = resolver.openOutputStream(uri)
             ?: throw IllegalStateException("Dosya yazılamadı.")
         out.use { o -> file.inputStream().use { it.copyTo(o) } }
