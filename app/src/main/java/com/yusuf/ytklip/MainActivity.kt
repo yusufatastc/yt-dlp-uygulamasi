@@ -310,8 +310,8 @@ class MainActivity : Activity() {
             return
         }
 
-        var start = startInput.text.toString().trim()
-        var end = endInput.text.toString().trim()
+var start = startInput.text.toString().trim().replace('.', ':')
+var end = endInput.text.toString().trim().replace('.', ':')
         if (start.isNotEmpty() && !TIME_REGEX.matches(start)) {
             setStatus("Başlangıç zamanı hatalı. Örnek: 2:38:40 veya 90")
             return
